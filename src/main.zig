@@ -31,6 +31,7 @@ const OsVer = enum(u32) {
     catalina = 10,
     big_sur = 11,
     monterey = 12,
+    ventura = 13,
 };
 
 const Target = struct {
@@ -80,6 +81,7 @@ const Target = struct {
             10 => .catalina,
             11 => .big_sur,
             12 => .monterey,
+            13 => .ventura,
             else => unreachable,
         };
         return .{
@@ -116,12 +118,20 @@ const targets = [_]Target{
         .os_ver = .monterey,
     },
     Target{
+        .arch = .x86_64,
+        .os_ver = .ventura,
+    },
+    Target{
         .arch = .aarch64,
         .os_ver = .big_sur,
     },
     Target{
         .arch = .aarch64,
         .os_ver = .monterey,
+    },
+    Target{
+        .arch = .aarch64,
+        .os_ver = .ventura,
     },
 };
 
@@ -317,8 +327,8 @@ fn fetchHeaders(allocator: Allocator, args: []const []const u8) !void {
 }
 
 /// Dedups libs headers assuming the following layered structure:
-/// layer 1: x86_64-macos.10 x86_64-macos.11 x86_64-macos.12 aarch64-macos.11 aarch64-macos.12
-/// layer 2: any-macos.10 any-macos.11 any-macos.12
+/// layer 1: x86_64-macos.10 x86_64-macos.11 x86_64-macos.12 x86_64-macos.13 aarch64-macos.11 aarch64-macos.12 aarch64-macos.13
+/// layer 2: any-macos.10 any-macos.11 any-macos.12 any-macos.13
 /// layer 3: any-macos
 ///
 /// The first layer consists of headers specific to a CPU architecture AND macOS version. The second
@@ -347,7 +357,7 @@ fn generateDedupDirs(allocator: Allocator, args: []const []const u8) !void {
     var layer_2_targets = std.ArrayList(TargetWithPrefix).init(allocator);
     defer layer_2_targets.deinit();
 
-    for (&[_]OsVer{ .catalina, .big_sur, .monterey }) |os_ver| {
+    for (&[_]OsVer{ .catalina, .big_sur, .monterey, .ventura }) |os_ver| {
         var layer_1_targets = std.ArrayList(TargetWithPrefix).init(allocator);
         defer layer_1_targets.deinit();
 
