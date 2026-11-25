@@ -1,10 +1,11 @@
 const std = @import("std");
 const fs = std.fs;
-const io = std.io;
+const Io = std.Io;
+const Dir = Io.Dir;
 const mem = std.mem;
 const process = std.process;
 const assert = std.debug.assert;
-const tmpDir = std.testing.tmpDir;
+
 
 const Allocator = mem.Allocator;
 const Blake3 = std.crypto.hash.Blake3;
@@ -45,7 +46,7 @@ const Target = struct {
         std.hash.autoHash(&hasher, a.os);
         std.hash.autoHash(&hasher, a.os_ver);
         std.hash.autoHash(&hasher, a.abi);
-        return @truncate(u32, hasher.final());
+        return @as(u32, @truncate(hasher.final()));
     }
 
     fn eql(a: Target, b: Target) bool {
@@ -68,7 +69,7 @@ const Target = struct {
         return std.fmt.allocPrint(allocator, "{s}-{s}.{d}-{s}", .{
             @tagName(self.arch),
             @tagName(self.os),
-            @enumToInt(self.os_ver),
+            @intFromEnum(self.os_ver),
             @tagName(self.abi),
         });
     }
@@ -150,7 +151,7 @@ const TargetToHashContext = struct {
         return a.eql(b);
     }
 };
-const TargetToHash = std.ArrayHashMap(Target, []const u8, TargetToHashContext, true);
+const TargetToHash = std.array_hash_map.Custom(Target, []const u8, TargetToHashContext, true);
 
 const HashToContents = std.StringHashMap(Contents);
 const PathTable = std.StringHashMap(*TargetToHash);
@@ -200,41 +201,41 @@ const hint =
     \\See -h/--help for more info.
 ;
 
-fn mainArgs(allocator: Allocator, all_args: []const []const u8) !void {
+fn mainArgs(io: Io, allocator: Allocator, all_args: []const []const u8) !void {
     const args = all_args[1..];
     if (args.len == 0) {
-        try io.getStdErr().writeAll("fatal: no command or option specified\n\n");
-        try io.getStdOut().writeAll(hint);
+        try Io.File.stderr().writeStreamingAll(io, "fatal: no command or option specified\n\n");
+        try Io.File.stdout().writeStreamingAll(io, hint);
         return;
     }
 
     const first_arg = args[0];
     if (mem.eql(u8, first_arg, "--help") or mem.eql(u8, first_arg, "-h")) {
-        try io.getStdOut().writeAll(usage);
+        try Io.File.stdout().writeStreamingAll(io, usage);
         return;
     } else if (mem.eql(u8, first_arg, "generate")) {
-        return generateDedupDirs(allocator, args[1..]);
+        return generateDedupDirs(io, allocator, args[1..]);
     } else if (mem.eql(u8, first_arg, "fetch")) {
-        return fetchHeaders(allocator, args[1..]);
+        return fetchHeaders(io, allocator, args[1..]);
     } else {
         const msg = try std.fmt.allocPrint(allocator, "fatal: unknown command or option: {s}", .{first_arg});
-        try io.getStdErr().writeAll(msg);
+        try Io.File.stderr().writeStreamingAll(io, msg);
         return;
     }
 }
 
-fn fetchHeaders(allocator: Allocator, args: []const []const u8) !void {
-    var tmp = tmpDir(.{});
-    defer tmp.cleanup();
+fn fetchHeaders(io: Io, allocator: Allocator, args: []const []const u8) !void {
+    var tmp = try tmpDir(io, .{});
+    defer tmp.cleanup(io);
 
-    const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
+    const tmp_path = try tmp.dir.realPathFileAlloc(io, ".", allocator);
     const tmp_filename = "headers";
     const tmp_file_path = try fs.path.join(allocator, &[_][]const u8{ tmp_path, tmp_filename });
 
     const headers_list_filename = "headers.o.d";
     const headers_list_path = try fs.path.join(allocator, &[_][]const u8{ tmp_path, headers_list_filename });
 
-    var argv = std.ArrayList([]const u8).init(allocator);
+    var argv = std.array_list.Managed([]const u8).init(allocator);
     try argv.appendSlice(&[_][]const u8{
         "cc",
         "-o",
@@ -249,8 +250,7 @@ fn fetchHeaders(allocator: Allocator, args: []const []const u8) !void {
 
     // TODO instead of calling `cc` as a child process here,
     // hook in directly to `zig cc` API.
-    const res = try std.ChildProcess.exec(.{
-        .allocator = allocator,
+    const res = try std.process.run(allocator, io, .{
         .argv = argv.items,
     });
 
@@ -259,60 +259,59 @@ fn fetchHeaders(allocator: Allocator, args: []const []const u8) !void {
     }
 
     // Read in the contents of `upgrade.o.d`
-    const headers_list_file = try tmp.dir.openFile(headers_list_filename, .{});
-    defer headers_list_file.close();
+    const headers_list_str = try tmp.dir.readFileAlloc(io, headers_list_filename, allocator, .unlimited);
 
-    var headers_dir = fs.cwd().openDir(headers_source_prefix, .{}) catch |err| switch (err) {
+    const headers_dir = Dir.cwd().openDir(io, headers_source_prefix, .{}) catch |err| switch (err) {
         error.FileNotFound, error.NotDir => {
             const msg = try std.fmt.allocPrint(
                 allocator,
                 "fatal: path '{s}' not found or not a directory. Did you accidentally delete it?",
                 .{headers_source_prefix},
             );
-            try io.getStdErr().writeAll(msg);
+            try Io.File.stderr().writeStreamingAll(io, msg);
             process.exit(1);
         },
         else => return err,
     };
-    defer headers_dir.close();
+    defer headers_dir.close(io);
 
-    const dest_target_info = try std.zig.system.NativeTargetInfo.detect(allocator, .{});
-    const dest_target = Target.fromStdTarget(dest_target_info.target);
+    var diagnostics: std.zig.system.ResolveTargetDiagnostics = .none;
+    const native_target = try std.zig.system.resolveTargetQuery(io, allocator, .{}, &diagnostics);
+    const dest_target = Target.fromStdTarget(native_target);
     const dest_path = try dest_target.fullName(allocator);
-    try headers_dir.deleteTree(dest_path);
+    try headers_dir.deleteTree(io, dest_path);
 
-    var dest_dir = try headers_dir.makeOpenPath(dest_path, .{});
-    var dirs = std.StringHashMap(fs.Dir).init(allocator);
+    const dest_dir = try headers_dir.createDirPathOpen(io, dest_path, .{});
+    var dirs = std.StringHashMap(Dir).init(allocator);
     try dirs.putNoClobber(".", dest_dir);
 
-    const headers_list_str = try headers_list_file.reader().readAllAlloc(allocator, std.math.maxInt(usize));
     const prefix = "/usr/include";
 
-    var it = mem.split(u8, headers_list_str, "\n");
+    var it = mem.splitSequence(u8, headers_list_str, "\n");
     while (it.next()) |line| {
-        if (mem.lastIndexOf(u8, line, "clang") != null) continue;
-        if (mem.lastIndexOf(u8, line, prefix[0..])) |idx| {
+        if (mem.findLast(u8, line, "clang") != null) continue;
+        if (mem.findLast(u8, line, prefix[0..])) |idx| {
             const out_rel_path = line[idx + prefix.len + 1 ..];
             const out_rel_path_stripped = mem.trim(u8, out_rel_path, " \\");
             const dirname = fs.path.dirname(out_rel_path_stripped) orelse ".";
             const maybe_dir = try dirs.getOrPut(dirname);
             if (!maybe_dir.found_existing) {
-                maybe_dir.value_ptr.* = try dest_dir.makeOpenPath(dirname, .{});
+                maybe_dir.value_ptr.* = try dest_dir.createDirPathOpen(io, dirname, .{});
             }
             const basename = fs.path.basename(out_rel_path_stripped);
 
             const line_stripped = mem.trim(u8, line, " \\");
             const abs_dirname = fs.path.dirname(line_stripped).?;
-            var orig_subdir = try fs.cwd().openDir(abs_dirname, .{});
-            defer orig_subdir.close();
+            const orig_subdir = try Dir.cwd().openDir(io, abs_dirname, .{});
+            defer orig_subdir.close(io);
 
-            try orig_subdir.copyFile(basename, maybe_dir.value_ptr.*, basename, .{});
+            try orig_subdir.copyFile(basename, maybe_dir.value_ptr.*, basename, io, .{});
         }
     }
 
     var dir_it = dirs.iterator();
     while (dir_it.next()) |entry| {
-        entry.value_ptr.close();
+        entry.value_ptr.close(io);
     }
 }
 
@@ -324,31 +323,31 @@ fn fetchHeaders(allocator: Allocator, args: []const []const u8) !void {
 /// The first layer consists of headers specific to a CPU architecture AND macOS version. The second
 /// layer consists of headers common to a macOS version across CPU architectures, and the final
 /// layer consists of headers common to all libc headers.
-fn generateDedupDirs(allocator: Allocator, args: []const []const u8) !void {
+fn generateDedupDirs(io: Io, allocator: Allocator, args: []const []const u8) !void {
     if (args.len < 1) {
-        try io.getStdErr().writeAll("fatal: no destination path specified");
+        try Io.File.stderr().writeStreamingAll(io, "fatal: no destination path specified");
         process.exit(1);
     }
 
     const dest_path = args[0];
-    var dest_dir = fs.cwd().makeOpenPath(dest_path, .{}) catch |err| switch (err) {
+    const dest_dir = Dir.cwd().createDirPathOpen(io, dest_path, .{}) catch |err| switch (err) {
         error.NotDir => {
             const msg = try std.fmt.allocPrint(allocator, "fatal: path '{s}' not a directory", .{dest_path});
-            try io.getStdErr().writeAll(msg);
+            try Io.File.stderr().writeStreamingAll(io, msg);
             process.exit(1);
         },
         else => return err,
     };
-    defer dest_dir.close();
+    defer dest_dir.close(io);
 
     var dont_dedup_map = try generateDontDedupMap(allocator);
     defer dont_dedup_map.deinit();
 
-    var layer_2_targets = std.ArrayList(TargetWithPrefix).init(allocator);
+    var layer_2_targets = std.array_list.Managed(TargetWithPrefix).init(allocator);
     defer layer_2_targets.deinit();
 
     for (&[_]OsVer{ .catalina, .big_sur, .monterey }) |os_ver| {
-        var layer_1_targets = std.ArrayList(TargetWithPrefix).init(allocator);
+        var layer_1_targets = std.array_list.Managed(TargetWithPrefix).init(allocator);
         defer layer_1_targets.deinit();
 
         for (targets) |target| {
@@ -364,7 +363,7 @@ fn generateDedupDirs(allocator: Allocator, args: []const []const u8) !void {
             continue;
         }
 
-        const layer_2_target = try dedupDirs(allocator, .{
+        const layer_2_target = try dedupDirs(io, allocator, .{
             .os_ver = os_ver,
             .dest_path = dest_path,
             .dest_dir = dest_dir,
@@ -374,7 +373,7 @@ fn generateDedupDirs(allocator: Allocator, args: []const []const u8) !void {
         try layer_2_targets.append(layer_2_target);
     }
 
-    const layer_3_target = try dedupDirs(allocator, .{
+    const layer_3_target = try dedupDirs(io, allocator, .{
         .os_ver = .any,
         .dest_path = dest_path,
         .dest_dir = dest_dir,
@@ -392,30 +391,30 @@ const TargetWithPrefix = struct {
 const DedupDirsArgs = struct {
     os_ver: OsVer,
     dest_path: []const u8,
-    dest_dir: fs.Dir,
+    dest_dir: Dir,
     targets: []const TargetWithPrefix,
     dont_dedup_map: *const std.StringHashMap(void),
 };
 
-fn dedupDirs(allocator: Allocator, args: DedupDirsArgs) !TargetWithPrefix {
-    var tmp = tmpDir(.{
+fn dedupDirs(io: Io, allocator: Allocator, args: DedupDirsArgs) !TargetWithPrefix {
+    var tmp = try tmpDir(io, .{
         .iterate = true,
     });
-    defer tmp.cleanup();
+    defer tmp.cleanup(io);
 
     var path_table = PathTable.init(allocator);
     var hash_to_contents = HashToContents.init(allocator);
 
     var savings = FindResult{};
     for (args.targets) |target| {
-        const res = try findDuplicates(target.target, allocator, target.prefix, &path_table, &hash_to_contents);
+        const res = try findDuplicates(io, target.target, allocator, target.prefix, &path_table, &hash_to_contents);
         savings.max_bytes_saved += res.max_bytes_saved;
         savings.total_bytes += res.total_bytes;
     }
 
-    std.log.warn("summary: {} could be reduced to {}", .{
-        std.fmt.fmtIntSizeBin(savings.total_bytes),
-        std.fmt.fmtIntSizeBin(savings.total_bytes - savings.max_bytes_saved),
+    std.log.warn("summary: {d} bytes could be reduced to {d} bytes", .{
+        savings.total_bytes,
+        savings.total_bytes - savings.max_bytes_saved,
     });
 
     const output_target = Target{
@@ -432,7 +431,7 @@ fn dedupDirs(allocator: Allocator, args: DedupDirsArgs) !TargetWithPrefix {
     var path_it = path_table.iterator();
     while (path_it.next()) |path_kv| {
         if (!args.dont_dedup_map.contains(path_kv.key_ptr.*)) {
-            var contents_list = std.ArrayList(*Contents).init(allocator);
+            var contents_list = std.array_list.Managed(*Contents).init(allocator);
             {
                 var hash_it = path_kv.value_ptr.*.iterator();
                 while (hash_it.next()) |hash_kv| {
@@ -440,20 +439,20 @@ fn dedupDirs(allocator: Allocator, args: DedupDirsArgs) !TargetWithPrefix {
                     try contents_list.append(contents);
                 }
             }
-            std.sort.sort(*Contents, contents_list.items, {}, Contents.hitCountLessThan);
-            const best_contents = contents_list.popOrNull().?;
+            std.mem.sort(*Contents, contents_list.items, {}, Contents.hitCountLessThan);
+            const best_contents = contents_list.pop().?;
             if (best_contents.hit_count > 1) {
                 // Put it in `any-macos-none`.
                 const full_path = try fs.path.join(allocator, &[_][]const u8{ common_name, path_kv.key_ptr.* });
-                try tmp.dir.makePath(fs.path.dirname(full_path).?);
-                try tmp.dir.writeFile(full_path, best_contents.bytes);
+                try tmp.dir.createDirPath(io, fs.path.dirname(full_path).?);
+                try tmp.dir.writeFile(io, .{ .sub_path = full_path, .data = best_contents.bytes });
                 best_contents.is_generic = true;
-                while (contents_list.popOrNull()) |contender| {
+                while (contents_list.pop()) |contender| {
                     if (contender.hit_count > 1) {
                         const this_missed_bytes = contender.hit_count * contender.bytes.len;
                         missed_opportunity_bytes += this_missed_bytes;
-                        std.log.warn("Missed opportunity ({}): {s}", .{
-                            std.fmt.fmtIntSizeBin(this_missed_bytes),
+                        std.log.warn("Missed opportunity ({d} bytes): {s}", .{
+                            this_missed_bytes,
                             path_kv.key_ptr.*,
                         });
                     } else break;
@@ -468,26 +467,26 @@ fn dedupDirs(allocator: Allocator, args: DedupDirsArgs) !TargetWithPrefix {
             const target = hash_kv.key_ptr.*;
             const target_name = try target.fullName(allocator);
             const full_path = try fs.path.join(allocator, &[_][]const u8{ target_name, path_kv.key_ptr.* });
-            try tmp.dir.makePath(fs.path.dirname(full_path).?);
-            try tmp.dir.writeFile(full_path, contents.bytes);
+            try tmp.dir.createDirPath(io, fs.path.dirname(full_path).?);
+            try tmp.dir.writeFile(io, .{ .sub_path = full_path, .data = contents.bytes });
         }
     }
 
     for (args.targets) |target| {
         const target_name = try target.target.fullName(allocator);
-        try args.dest_dir.deleteTree(target_name);
+        try args.dest_dir.deleteTree(io, target_name);
     }
-    try args.dest_dir.deleteTree(common_name);
+    try args.dest_dir.deleteTree(io, common_name);
 
     var tmp_it = tmp.dir.iterate();
-    while (try tmp_it.next()) |entry| {
+    while (try tmp_it.next(io)) |entry| {
         switch (entry.kind) {
-            .Directory => {
-                const sub_dir = try tmp.dir.openDir(entry.name, .{
+            .directory => {
+                const sub_dir = try tmp.dir.openDir(io, entry.name, .{
                     .iterate = true,
                 });
-                const dest_sub_dir = try args.dest_dir.makeOpenPath(entry.name, .{});
-                try copyDirAll(sub_dir, dest_sub_dir);
+                const dest_sub_dir = try args.dest_dir.createDirPathOpen(io, entry.name, .{});
+                try copyDirAll(io, sub_dir, dest_sub_dir);
             },
             else => {
                 std.log.warn("unexpected file format: not a directory: '{s}'", .{entry.name});
@@ -507,6 +506,7 @@ const FindResult = struct {
 };
 
 fn findDuplicates(
+    io: Io,
     target: Target,
     allocator: Allocator,
     dest_path: []const u8,
@@ -517,29 +517,29 @@ fn findDuplicates(
 
     const target_name = try target.fullName(allocator);
     const target_include_dir = try fs.path.join(allocator, &[_][]const u8{ dest_path, target_name });
-    var dir_stack = std.ArrayList([]const u8).init(allocator);
+    var dir_stack = std.array_list.Managed([]const u8).init(allocator);
     try dir_stack.append(target_include_dir);
 
-    while (dir_stack.popOrNull()) |full_dir_name| {
-        var dir = fs.cwd().openDir(full_dir_name, .{
+    while (dir_stack.pop()) |full_dir_name| {
+        const dir = Dir.cwd().openDir(io, full_dir_name, .{
             .iterate = true,
         }) catch |err| switch (err) {
             error.FileNotFound => break,
             error.AccessDenied => break,
             else => return err,
         };
-        defer dir.close();
+        defer dir.close(io);
 
         var dir_it = dir.iterate();
 
-        while (try dir_it.next()) |entry| {
+        while (try dir_it.next(io)) |entry| {
             const full_path = try fs.path.join(allocator, &[_][]const u8{ full_dir_name, entry.name });
             switch (entry.kind) {
-                .Directory => try dir_stack.append(full_path),
-                .File => {
-                    const rel_path = try fs.path.relative(allocator, target_include_dir, full_path);
+                .directory => try dir_stack.append(full_path),
+                .file => {
+                    const rel_path = try fs.path.relativePosix(allocator, "/", target_include_dir, full_path);
                     const max_size = 2 * 1024 * 1024 * 1024;
-                    const raw_bytes = try fs.cwd().readFileAlloc(allocator, full_path, max_size);
+                    const raw_bytes = try Dir.cwd().readFileAlloc(io, full_path, allocator, .limited(max_size));
                     const trimmed = mem.trim(u8, raw_bytes, " \r\n\t");
                     result.total_bytes += raw_bytes.len;
                     const hash = try allocator.alloc(u8, 32);
@@ -554,7 +554,7 @@ fn findDuplicates(
                         std.log.warn("duplicate: {s} {s} ({})", .{
                             target_name,
                             rel_path,
-                            std.fmt.fmtIntSizeBin(raw_bytes.len),
+                            raw_bytes.len,
                         });
                     } else {
                         gop.value_ptr.* = Contents{
@@ -567,11 +567,11 @@ fn findDuplicates(
                     const path_gop = try path_table.getOrPut(rel_path);
                     const target_to_hash = if (path_gop.found_existing) path_gop.value_ptr.* else blk: {
                         const ptr = try allocator.create(TargetToHash);
-                        ptr.* = TargetToHash.init(allocator);
+                        ptr.* = .empty;
                         path_gop.value_ptr.* = ptr;
                         break :blk ptr;
                     };
-                    try target_to_hash.putNoClobber(target, hash);
+                    try target_to_hash.putNoClobber(allocator, target, hash);
                 },
                 else => std.log.warn("unexpected file: {s}", .{full_path}),
             }
@@ -581,43 +581,53 @@ fn findDuplicates(
     return result;
 }
 
-fn copyDirAll(source: fs.Dir, dest: fs.Dir) anyerror!void {
+fn copyDirAll(io: Io, source: Dir, dest: Dir) anyerror!void {
     var it = source.iterate();
-    while (try it.next()) |next| {
+    while (try it.next(io)) |next| {
         switch (next.kind) {
-            .Directory => {
-                var sub_dir = try dest.makeOpenPath(next.name, .{});
-                var sub_source = try source.openDir(next.name, .{
+            .directory => {
+                const sub_dir = try dest.createDirPathOpen(io, next.name, .{});
+                const sub_source = try source.openDir(io, next.name, .{
                     .iterate = true,
                 });
                 defer {
-                    sub_dir.close();
-                    sub_source.close();
+                    sub_dir.close(io);
+                    sub_source.close(io);
                 }
-                try copyDirAll(sub_source, sub_dir);
+                try copyDirAll(io, sub_source, sub_dir);
             },
-            .File => {
-                var source_file = try source.openFile(next.name, .{});
-                var dest_file = try dest.createFile(next.name, .{});
-                defer {
-                    source_file.close();
-                    dest_file.close();
-                }
-                const stat = try source_file.stat();
-                const ncopied = try source_file.copyRangeAll(0, dest_file, 0, stat.size);
-                assert(ncopied == stat.size);
-            },
+            .file => try source.copyFile(next.name, dest, next.name, io, .{}),
             else => |kind| {
-                std.log.warn("unexpected file kind '{s}' will be ignored", .{kind});
+                std.log.warn("unexpected file kind '{t}' will be ignored", .{kind});
             },
         }
     }
 }
 
-pub fn main() anyerror!void {
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    const allocator = arena.allocator();
+const TempDir = struct {
+    dir: Dir,
+    path: [".zig-cache/tmp/".len + 32]u8,
 
-    const args = try std.process.argsAlloc(allocator);
-    return mainArgs(allocator, args);
+    fn cleanup(tmp: *TempDir, io: Io) void {
+        tmp.dir.close(io);
+        Dir.cwd().deleteTree(io, &tmp.path) catch {};
+    }
+};
+
+fn tmpDir(io: Io, options: Dir.OpenOptions) !TempDir {
+    const prefix = ".zig-cache/tmp/";
+    const cwd = Dir.cwd();
+    try cwd.createDirPath(io, prefix);
+    var random: [16]u8 = undefined;
+    try io.randomSecure(&random);
+    const path = prefix.* ++ std.fmt.bytesToHex(random, .lower);
+    try cwd.createDir(io, &path, .default_dir);
+    errdefer cwd.deleteTree(io, &path) catch {};
+    return .{ .dir = try cwd.openDir(io, &path, options), .path = path };
+}
+
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.arena.allocator();
+    const args = try init.minimal.args.toSlice(allocator);
+    return mainArgs(init.io, allocator, args);
 }
